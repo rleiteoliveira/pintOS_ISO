@@ -89,7 +89,7 @@ threads/loader.o: threads/loader.S
 	$(CC) -c $< -o $@ $(ASFLAGS) $(CPPFLAGS) $(DEFINES)
 
 loader.bin: threads/loader.o
-	$(LD) -N -e 0 -Ttext 0x7c00 --oformat binary -o $@ $<
+	$(LD) --build-id=none -N -e 0 -Ttext 0x7c00 --oformat binary -o $@ $<
 
 os.dsk: kernel.bin
 	cat $^ > $@
