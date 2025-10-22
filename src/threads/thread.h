@@ -5,10 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
-<<<<<<< Updated upstream
-=======
 #include "filesys/file.h"
->>>>>>> Stashed changes
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -103,24 +100,18 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
-<<<<<<< Updated upstream
-=======
     
->>>>>>> Stashed changes
     //Adição
     struct thread *parent_process;
     bool waited_by_parent;
     struct semaphore wait_sema;
     int exit_status;
-<<<<<<< Updated upstream
-=======
 
     struct file *open_files[128];
     int next_fd;
 
     struct semaphore load_sema;
     bool load_success;
->>>>>>> Stashed changes
 #endif
 
     /* Owned by thread.c. */
