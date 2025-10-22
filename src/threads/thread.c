@@ -537,6 +537,19 @@ init_thread (struct thread *t, const char *name, int priority)
 
   t->waited_by_parent = false;
 
+<<<<<<< Updated upstream
+=======
+  // Inicializa a tabela de arquivos abertos
+  t->next_fd = 2;
+  for (int i = 0; i < 128; i++)
+  {
+    t->open_files[i] = NULL;
+  }
+
+  sema_init(&t->load_sema, 0);
+  t->load_success = false;
+
+>>>>>>> Stashed changes
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);

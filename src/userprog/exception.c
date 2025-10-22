@@ -151,11 +151,24 @@ page_fault (struct intr_frame *f)
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
      which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+
+     //Adição
+  if (user) // A falha ocorreu enquanto o CPU estava em modo usuário?
+  {
+     struct thread *cur = thread_current();
+     printf("%s: exit(%d)\n", cur->name, -1); // Imprime a mensagem padrão de saída com erro
+     cur->exit_status = -1;
+     thread_exit();
+  }
+  else // A falha ocorreu enquanto o CPU estava em modo kernel.
+  {
+     // Imprime informações detalhadas sobre a falha do kernel e entra em pânico.
+     printf("Page fault at %p: %s error %s page in kernel context.\n",
+            fault_addr,
+            not_present ? "not present" : "rights violation",
+            write ? "writing" : "reading");
+     intr_dump_frame(f);
+     PANIC("Kernel page fault");
+  }
 }
 

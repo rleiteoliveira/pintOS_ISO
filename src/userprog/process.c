@@ -62,8 +62,29 @@ process_execute (const char *file_name)
   //Adicionado
   palloc_free_page(exec_name_copy);
 
+<<<<<<< Updated upstream
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
+=======
+  if (tid == TID_ERROR){
+    palloc_free_page(fn_copy);
+    return TID_ERROR;
+  }
+
+  struct thread *child = get_thread_by_tid(tid);
+  if (child == NULL)
+  {
+    return TID_ERROR;
+  }
+
+  sema_down(&child->load_sema);
+
+  if (child->load_success == false)
+  {
+    return TID_ERROR;
+  }
+
+>>>>>>> Stashed changes
   return tid;
 }
 
@@ -104,6 +125,14 @@ start_process (void *file_name_)
   // Libera a cópia do nome do executável.
   palloc_free_page(exec_name_copy);
 
+<<<<<<< Updated upstream
+=======
+  struct thread *cur = thread_current();
+
+  cur->load_success = success;
+  sema_up(&cur->load_sema);
+
+>>>>>>> Stashed changes
   // Se o load teve sucesso, configura a pilha com os argumentos
   if (success)
   {
@@ -113,8 +142,14 @@ start_process (void *file_name_)
 
   /* If load failed, quit. */
   palloc_free_page(full_cmdline); //Libera a cópia
+<<<<<<< Updated upstream
   if (!success) 
     thread_exit ();
+=======
+  if (!success){
+    thread_exit();
+  }
+>>>>>>> Stashed changes
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -151,6 +186,12 @@ int process_wait(tid_t child_tid)
   // Retrieve the child's exit status AFTER waking up
   int status = child->exit_status;
 
+<<<<<<< Updated upstream
+=======
+  // Adição
+  child->waited_by_parent = true;
+
+>>>>>>> Stashed changes
   return status;
 }
 
