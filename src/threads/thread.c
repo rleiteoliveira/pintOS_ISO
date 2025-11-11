@@ -71,6 +71,25 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+//Criação !!!
+//Verifica se a thread atual deve ceder a CPU
+static void
+yield_if_needed(void)
+{
+  //Desabilita interrupções para evitar condições de corrida
+  ASSERT(intr_get_level() == INTR_OFF);
+
+  //Verifica se a lista de prontos não está vazia e se a prioridade da thread na frente da lista é maior que a da thread atual
+  if (!list_empty(&ready_list) &&
+      list_entry(list_front(&ready_list), struct thread, elem)->priority > thread_current()->priority)
+  {
+    if (intr_context())
+      intr_yield_on_return();
+    else
+      thread_yield();
+  }
+}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -84,6 +103,18 @@ static tid_t allocate_tid (void);
 
    It is not safe to call thread_current() until this function
    finishes. */
+   
+//Adição !!!
+bool thread_priority_greater(const struct list_elem *a,
+                             const struct list_elem *b,
+                             void *aux UNUSED)
+{
+  const struct thread *thread_a = list_entry(a, struct thread, elem);
+  const struct thread *thread_b = list_entry(b, struct thread, elem);
+
+  return thread_a->priority > thread_b->priority;
+}
+
 void
 thread_init (void) 
 {
@@ -201,6 +232,12 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  // Adição !!!
+  // Verifica se a nova thread deve preemptar a atual.
+  enum intr_level old_level = intr_disable();
+  yield_if_needed();
+  intr_set_level(old_level);
+
   return tid;
 }
 
@@ -237,8 +274,11 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  //list_push_back (&ready_list, &t->elem);
+  //Alteração!!!
+  list_insert_ordered(&ready_list, &t->elem, thread_priority_greater, NULL);
   t->status = THREAD_READY;
+
   intr_set_level (old_level);
 }
 
@@ -277,8 +317,8 @@ thread_tid (void)
 
 /* Deschedules the current thread and destroys it.  Never
    returns to the caller. */
-void
-thread_exit (void) 
+void NO_RETURN
+thread_exit(void)
 {
   ASSERT (!intr_context ());
 
@@ -286,12 +326,17 @@ thread_exit (void)
   process_exit ();
 #endif
 
+  // Adição
+  struct thread *cur = thread_current();
+  sema_up(&cur->wait_sema);
+
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
   intr_disable ();
-  list_remove (&thread_current()->allelem);
-  thread_current ()->status = THREAD_DYING;
+  //Alteração
+  //list_remove(&cur->allelem);
+  cur->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
 }
@@ -308,7 +353,9 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    //list_push_back (&ready_list, &cur->elem);
+    //Alteração!!!
+    list_insert_ordered(&ready_list, &cur->elem, thread_priority_greater, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -335,7 +382,17 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  //Adição !!!
+  //Protege contra race conditions
+  enum intr_level old_level = intr_disable();
+
   thread_current ()->priority = new_priority;
+
+  //Adição !!!
+  //Verifica se outras threads na fila tenham maior prioridade
+  yield_if_needed();
+
+  intr_set_level(old_level);
 }
 
 /* Returns the current thread's priority. */
@@ -464,6 +521,34 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
 
+  //Adição
+  sema_init(&t->wait_sema, 0);
+  t->exit_status = -1;
+
+  // A thread inicial (main) não tem pai e seu status ainda não é RUNNING aqui.
+  if (t == initial_thread)
+  {
+    t->parent_process = NULL;
+  }
+  else
+  {
+    t->parent_process = thread_current(); // Outras threads pegam quem as criou como pai
+  }
+
+  t->waited_by_parent = false;
+
+  // Inicializa a tabela de arquivos abertos
+  t->next_fd = 2;
+  for (int i = 0; i < 128; i++)
+  {
+    t->open_files[i] = NULL;
+  }
+
+  sema_init(&t->load_sema, 0);
+  t->load_success = false;
+
+  t->executable_file = NULL;
+
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
@@ -535,10 +620,16 @@ thread_schedule_tail (struct thread *prev)
      pull out the rug under itself.  (We don't free
      initial_thread because its memory was not obtained via
      palloc().) */
-  if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) 
+  if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread)
+  {
+    ASSERT(prev != cur);
+    // Alteração
+    //  SÓ LIBERA SE O PAI JÁ ESPEROU
+    if (prev->parent_process == NULL)
     {
-      ASSERT (prev != cur);
-      palloc_free_page (prev);
+      list_remove(&prev->allelem);
+      palloc_free_page(prev);
+    }
     }
 }
 
@@ -582,3 +673,25 @@ allocate_tid (void)
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+//Adição
+struct thread *get_thread_by_tid(tid_t tid)
+{
+  struct list_elem *e;
+  struct thread *found_thread = NULL;
+
+  // It's safer to iterate with interrupts off if all_list can change
+  enum intr_level old_level = intr_disable();
+
+  for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e))
+  {
+    struct thread *t = list_entry(e, struct thread, allelem);
+    if (t->tid == tid)
+    {
+      found_thread = t;
+      break;
+    }
+  }
+  intr_set_level(old_level);
+  return found_thread;
+}

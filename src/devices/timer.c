@@ -36,7 +36,7 @@ static void real_time_delay(int64_t num, int32_t denom);
    and registers the corresponding interrupt. */
 void timer_init(void)
 {
-  // Adição!!!
+  //Adição!!!
   list_init(&sleeping_list);
 
   pit_configure_channel(0, 2, TIMER_FREQ);
@@ -89,10 +89,10 @@ timer_elapsed(int64_t then)
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
-// Modificação!!!
+//Modificação!!!
 void timer_sleep(int64_t ticks)
 {
-  // Verifica para acordar
+  //Verifica para acordar
   if (ticks <= 0)
   {
     return;
@@ -101,15 +101,15 @@ void timer_sleep(int64_t ticks)
   struct thread *cur = thread_current();
   enum intr_level old_level;
 
-  // Desabilita interrupções
-  // Calcula e armazena o tick em que a thread deve acordar
-  // Adiciona a thread atual na lista de adormecidas e a bloqueia
+  //Desabilita interrupções
+  //Calcula e armazena o tick em que a thread deve acordar
+  //Adiciona a thread atual na lista de adormecidas e a bloqueia
   old_level = intr_disable();
   cur->wakeup_tick = timer_ticks() + ticks;
   list_push_back(&sleeping_list, &cur->elem);
   thread_block();
 
-  // Reabilitamos as interrupções.
+  //Reabilitamos as interrupções.
   intr_set_level(old_level);
 }
 
@@ -183,7 +183,7 @@ timer_interrupt(struct intr_frame *args UNUSED)
   ticks++;
   thread_tick();
 
-  // Verifica se existe thread para acordar
+  //Verifica se existe thread para acordar
   struct list_elem *e = list_begin(&sleeping_list);
   while (e != list_end(&sleeping_list))
   {

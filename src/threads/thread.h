@@ -4,6 +4,8 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
+#include "filesys/file.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -92,10 +94,26 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
+   // Adição!!!
+    int64_t wakeup_tick;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    
+    //Adição
+    struct thread *parent_process;
+    bool waited_by_parent;
+    struct semaphore wait_sema;
+    int exit_status;
+
+    struct file *open_files[128];
+    int next_fd;
+
+    struct semaphore load_sema;
+    bool load_success;
+
+    struct file *executable_file;
 #endif
 
     /* Owned by thread.c. */
@@ -137,5 +155,8 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+//Adição!!!
+bool thread_priority_greater(const struct list_elem *a, const struct list_elem *b, void *aux);
+struct thread *get_thread_by_tid(tid_t tid);
 
 #endif /* threads/thread.h */
