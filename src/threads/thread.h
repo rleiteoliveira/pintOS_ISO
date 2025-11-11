@@ -112,6 +112,8 @@ struct thread
 
     struct semaphore load_sema;
     bool load_success;
+
+    struct file *executable_file;
 #endif
 
     /* Owned by thread.c. */

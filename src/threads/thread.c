@@ -335,7 +335,7 @@ thread_exit(void)
      when it calls thread_schedule_tail(). */
   intr_disable ();
   //Alteração
-  list_remove(&cur->allelem);
+  //list_remove(&cur->allelem);
   cur->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
@@ -547,6 +547,8 @@ init_thread (struct thread *t, const char *name, int priority)
   sema_init(&t->load_sema, 0);
   t->load_success = false;
 
+  t->executable_file = NULL;
+
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
@@ -618,15 +620,16 @@ thread_schedule_tail (struct thread *prev)
      pull out the rug under itself.  (We don't free
      initial_thread because its memory was not obtained via
      palloc().) */
-  if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) 
+  if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread)
+  {
+    ASSERT(prev != cur);
+    // Alteração
+    //  SÓ LIBERA SE O PAI JÁ ESPEROU
+    if (prev->parent_process == NULL)
     {
-      ASSERT (prev != cur);
-      //Alteração
-      // SÓ LIBERA SE O PAI JÁ ESPEROU
-      if (prev->waited_by_parent || prev->parent_process == NULL)
-      {
-        palloc_free_page(prev);
-      }
+      list_remove(&prev->allelem);
+      palloc_free_page(prev);
+    }
     }
 }
 

@@ -17,6 +17,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void (**eip)(void));
@@ -161,22 +162,47 @@ start_process (void *file_name_)
    //Alteração
 int process_wait(tid_t child_tid)
 {
+  //struct thread *cur = thread_current();
+  enum intr_level old_level = intr_disable();
   struct thread *child = get_thread_by_tid(child_tid);
 
-  if (child == NULL /* || child->parent_tid != thread_current()->tid */)
+  if (child == NULL || child->parent_process != thread_current() || child->waited_by_parent)
   {
+    intr_set_level(old_level); // Restaura as interrupções antes de sair
     return TID_ERROR; // Use TID_ERROR (-1) for invalid waits
   }
+
+  // if (child->waited_by_parent)
+  // {
+  //   return TID_ERROR; // -1
+  // }
+
+  // Adição
+  child->waited_by_parent = true;
 
   sema_down(&child->wait_sema);
 
   // Retrieve the child's exit status AFTER waking up
   int status = child->exit_status;
 
-  // Adição
-  child->waited_by_parent = true;
+  list_remove(&child->allelem);
+  palloc_free_page(child);
+
+  // Restaura o estado original das interrupções
+  intr_set_level(old_level);
 
   return status;
+}
+
+//Função auxiliar para deserdar filhos
+static void
+disown_child(struct thread *t, void *aux)
+{
+  struct thread *cur = (struct thread *)aux;
+  if (t->parent_process == cur)
+  {
+    t->parent_process = NULL;
+  }
 }
 
 /* Free the current process's resources. */
@@ -185,6 +211,34 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  enum intr_level old_level = intr_disable();
+
+  // Itera por todas as threads e "deserda" os filhos.
+  thread_foreach(disown_child, cur);
+
+  intr_set_level(old_level);
+
+  lock_acquire(&filesys_lock);
+
+  // 1. Fechar todos os arquivos abertos (FDs 2 a 127)
+  for (int fd = 2; fd < 128; fd++)
+  {
+    if (cur->open_files[fd] != NULL)
+    {
+      file_close(cur->open_files[fd]);
+      cur->open_files[fd] = NULL;
+    }
+  }
+
+  // 2. Permitir escrita e fechar o executável
+  if (cur->executable_file != NULL)
+  {
+    file_allow_write(cur->executable_file);
+    file_close(cur->executable_file);
+  }
+
+  lock_release(&filesys_lock);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -308,15 +362,18 @@ struct Elf32_Phdr
       goto done;
     process_activate();
 
+    lock_acquire(&filesys_lock);
+
     /* Open executable file. */
     file = filesys_open(file_name);
     if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
-      goto done; 
+      goto done_with_lock;
     }
 
   file_deny_write(file);
+  t->executable_file = file; // Salva o ponteiro do arquivo
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -328,7 +385,7 @@ struct Elf32_Phdr
       || ehdr.e_phnum > 1024) 
     {
       printf ("load: %s: error loading executable\n", file_name);
-      goto done; 
+      goto done_with_lock;
     }
 
   /* Read program headers. */
@@ -342,7 +399,7 @@ struct Elf32_Phdr
       file_seek (file, file_ofs);
 
       if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
-        goto done;
+        goto done_with_lock;
       file_ofs += sizeof phdr;
       switch (phdr.p_type) 
         {
@@ -356,7 +413,7 @@ struct Elf32_Phdr
         case PT_DYNAMIC:
         case PT_INTERP:
         case PT_SHLIB:
-          goto done;
+          goto done_with_lock;
         case PT_LOAD:
           if (validate_segment (&phdr, file)) 
             {
@@ -382,10 +439,10 @@ struct Elf32_Phdr
                 }
               if (!load_segment (file, file_page, (void *) mem_page,
                                  read_bytes, zero_bytes, writable))
-                goto done;
+                goto done_with_lock;
             }
           else
-            goto done;
+            goto done_with_lock;
           break;
         }
     }
@@ -395,11 +452,13 @@ struct Elf32_Phdr
 
   success = true;
 
- done:
-  /* We arrive here whether the load is successful or not. */
-  file_close (file);
-  return success;
-}
+  done_with_lock:
+    lock_release(&filesys_lock);
+
+  done:
+    /* We arrive here whether the load is successful or not. */
+    return success;
+  }
 
 /* load() helpers. */
 

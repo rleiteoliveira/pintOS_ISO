@@ -20,7 +20,8 @@
 static void syscall_handler (struct intr_frame *);
 //Adicionado
 static void validate_user_pointer(const void *uaddr);
-static struct lock filesys_lock;
+//static struct lock filesys_lock;
+struct lock filesys_lock;
 
 void
 syscall_init(void)
@@ -135,13 +136,17 @@ syscall_handler(struct intr_frame *f)
           // Escreve o pedaço do KERNEL para o arquivo
           int current_written = file_write(file_ptr, k_ptr, bytes_to_write);
 
-          if (current_written <= 0)
+          if (current_written < 0)
           { // Erro na escrita ou escreveu 0 bytes inesperadamente
             if (bytes_written == 0)
             {
               bytes_written = -1; // Sinaliza erro
             }
             break;
+          }
+          if (current_written == 0)
+          {
+            break; // Sai do loop
           }
           bytes_written += current_written;
           user_ptr += current_written;
@@ -463,6 +468,22 @@ syscall_handler(struct intr_frame *f)
 
       lock_release(&filesys_lock);
       f->eax = position;
+      break;
+    }
+
+    case SYS_WAIT:
+    {
+      // Valida o ponteiro para o argumento (TID)
+      validate_user_pointer(f->esp + 7);
+
+      // Obtém o TID do filho da pilha
+      tid_t child_tid = *(tid_t *)(f->esp + 4);
+
+      // Chama a sua função de kernel já existente
+      int status = process_wait(child_tid);
+
+      // Coloca o status de retorno no registrador EAX
+      f->eax = status;
       break;
     }
 

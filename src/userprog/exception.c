@@ -4,6 +4,7 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -162,13 +163,26 @@ page_fault (struct intr_frame *f)
   }
   else // A falha ocorreu enquanto o CPU estava em modo kernel.
   {
-     // Imprime informações detalhadas sobre a falha do kernel e entra em pânico.
-     printf("Page fault at %p: %s error %s page in kernel context.\n",
-            fault_addr,
-            not_present ? "not present" : "rights violation",
-            write ? "writing" : "reading");
-     intr_dump_frame(f);
-     PANIC("Kernel page fault");
+     /* O kernel falhou. FOI UM BUG DO KERNEL OU UM PONTEIRO RUIM DO USUÁRIO? */
+     if (is_user_vaddr(fault_addr))
+     {
+        // O kernel tentou acessar memória de usuário inválida (syscall ruim).
+        // Trate como um erro do usuário (exit -1).
+        struct thread *cur = thread_current();
+        printf("%s: exit(%d)\n", cur->name, -1);
+        cur->exit_status = -1;
+        thread_exit();
+     }
+     else
+     {
+        // Imprime informações detalhadas sobre a falha do kernel e entra em pânico.
+        printf("Page fault at %p: %s error %s page in kernel context.\n",
+               fault_addr,
+               not_present ? "not present" : "rights violation",
+               write ? "writing" : "reading");
+        intr_dump_frame(f);
+        PANIC("Kernel page fault");
+     }
   }
 }
 
