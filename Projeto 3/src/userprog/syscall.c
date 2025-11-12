@@ -15,13 +15,114 @@
 #include "threads/malloc.h"
 #include "threads/palloc.h"
 #include <string.h>
-
+#include "vm/page.h"
+#include "vm/frame.h"
 
 static void syscall_handler (struct intr_frame *);
 //Adicionado
 static void validate_user_pointer(const void *uaddr);
 //static struct lock filesys_lock;
 struct lock filesys_lock;
+
+//Helper de VM
+static void
+validate_user_pointer(const void *uaddr)
+{
+  if (uaddr == NULL || !is_user_vaddr(uaddr))
+  {
+    thread_exit_with_status(-1);
+  }
+
+  //Tenta carregar a página na memória (seja do swap ou arquivo)
+  if (!vm_pin_page(pg_round_down(uaddr)))
+  {
+    thread_exit_with_status(-1); // Falhou ao carregar (ex: endereço inválido)
+  }
+
+  //Ok, a página é válida. Libera ela para eviction.
+  vm_unpin_page(pg_round_down(uaddr));
+}
+
+//Valida e "pina" um buffer de usuário inteiro
+static void
+vm_pin_buffer(const void *buffer, unsigned size, bool write_access)
+{
+  if (buffer == NULL || !is_user_vaddr(buffer))
+    thread_exit_with_status(-1);
+
+  if (size > 0 && !is_user_vaddr((char *)buffer + size - 1))
+    thread_exit_with_status(-1);
+
+  char *ptr = (char *)pg_round_down(buffer);
+  char *end = (char *)buffer + size;
+
+  for (; (void *)ptr < (void *)end; ptr += PGSIZE)
+  {
+    // Traz a página para a memória e a "pina"
+    if (!vm_pin_page(ptr))
+      thread_exit_with_status(-1);
+
+    // Se a syscall for de escrita, verifica se a página é writable
+    if (write_access)
+    {
+      struct spt_entry *spt_e = spt_find_page(&thread_current()->spt, ptr);
+      if (spt_e == NULL || !spt_e->writable)
+        thread_exit_with_status(-1);
+    }
+  }
+}
+
+// "Despina" um buffer de usuário, permitindo que ele sofra eviction.
+static void
+vm_unpin_buffer(const void *buffer, unsigned size)
+{
+  if (buffer == NULL)
+    return;
+
+  char *ptr = (char *)pg_round_down(buffer);
+  char *end = (char *)buffer + size;
+
+  for (; (void *)ptr < (void *)end; ptr += PGSIZE)
+  {
+    if (is_user_vaddr(ptr))
+      vm_unpin_page(ptr);
+  }
+}
+
+// Valida uma string (terminada em nulo) em memória de usuário.
+static void
+validate_user_string(const char *ustr)
+{
+  if (ustr == NULL || !is_user_vaddr(ustr))
+    thread_exit_with_status(-1);
+
+  void *upage = pg_round_down(ustr);
+
+  // Pina a primeira página
+  if (!vm_pin_page(upage))
+    thread_exit_with_status(-1);
+
+  //validate_user_pointer(ustr); // Valida o início
+  const char *ptr = ustr;
+  // Agora, percorre a string página por página até achar '\0'
+  while (true)
+  {
+    // Se o ponteiro saiu da página atual...
+    if (pg_round_down(ptr) != upage)
+    {
+      vm_unpin_page(upage);
+      upage = pg_round_down(ptr);
+      if (upage == NULL || !is_user_vaddr(upage) || !vm_pin_page(upage))
+        thread_exit_with_status(-1);
+    }
+    if (*ptr == '\0')
+      break;
+
+    ptr++;
+  }
+  // Despina a última página que foi lida
+  vm_unpin_page(upage);
+}
 
 void
 syscall_init(void)
@@ -30,6 +131,50 @@ syscall_init(void)
 
   //Adição
   lock_init(&filesys_lock);
+}
+
+void do_munmap(mapid_t mapping)
+{
+  struct thread *cur = thread_current();
+  struct list_elem *e;
+
+  //Encontra o mmap_entry na lista da thread
+  for (e = list_begin(&cur->mmap_list); e != list_end(&cur->mmap_list); e = list_next(e))
+  {
+    struct mmap_entry *mmap_e = list_entry(e, struct mmap_entry, elem);
+    if (mmap_e->mapid == mapping)
+    {
+      for (size_t i = 0; i < mmap_e->page_count; i++)
+      {
+        void *upage = mmap_e->addr + (i * PGSIZE);
+        struct spt_entry *spt_e = spt_find_page(&cur->spt, upage);
+
+        if (spt_e != NULL)
+        {
+          //Escreve de volta se estiver sujo
+          if (spt_e->status == IN_MEMORY && pagedir_is_dirty(cur->pagedir, upage))
+          {
+            lock_acquire(&filesys_lock);
+            file_write_at(spt_e->file, spt_e->kpage,
+                          spt_e->read_bytes, spt_e->file_offset);
+            lock_release(&filesys_lock);
+
+            pagedir_set_dirty(cur->pagedir, upage, false);
+          }
+          vm_free_page(upage);
+        }
+      }
+
+      //Fecha o arquivo e libera o mmap_entry
+      lock_acquire(&filesys_lock);
+      file_close(mmap_e->file);
+      lock_release(&filesys_lock);
+
+      list_remove(&mmap_e->elem);
+      free(mmap_e);
+      break;
+    }
+  }
 }
 
 static void
@@ -41,130 +186,56 @@ syscall_handler(struct intr_frame *f)
 
   switch (syscall_num)
   {
-  case SYS_HALT:
-  {
-    shutdown_power_off(); // Desliga o Pintos
-    break;
-  }
-  case SYS_EXIT:
-  {
-    // Valida a leitura do argumento 'status' (bytes 4-7)
-    validate_user_pointer(f->esp + 7);
-    int status = *(int *)(f->esp + 4);
-    thread_current()->exit_status = status;
-    printf("%s: exit(%d)\n", thread_current()->name, status);
-    thread_exit();
-    break;
-  }
-
-  case SYS_WRITE:
-  {
-    validate_user_pointer(f->esp + 15);
-    int fd = *(int *)(f->esp + 4);
-    const void *buffer = *(void **)(f->esp + 8);
-    unsigned size = *(unsigned *)(f->esp + 12);
-
-    validate_user_pointer(buffer);
-    if (size > 0)
+    case SYS_HALT:
     {
-      validate_user_pointer(buffer + size - 1);
+      shutdown_power_off(); // Desliga o Pintos
+      break;
+    }
+    case SYS_EXIT:
+    {
+      // Valida a leitura do argumento 'status' (bytes 4-7)
+      validate_user_pointer(f->esp + 7);
+      int status = *(int *)(f->esp + 4);
+      thread_current()->exit_status = status;
+      printf("%s: exit(%d)\n", thread_current()->name, status);
+      thread_exit();
+      break;
     }
 
-    int bytes_written = -1; // caso de erro
-
-    if (fd == 1)
+    case SYS_WRITE:
     {
-      const char *user_ptr = (const char *)buffer;
-      bytes_written = 0;
-      while ((unsigned)bytes_written < size)
+      validate_user_pointer(f->esp + 15);
+      int fd = *(int *)(f->esp + 4);
+      const void *buffer = *(void **)(f->esp + 8);
+      unsigned size = *(unsigned *)(f->esp + 12);
+
+      int bytes_written = -1;
+
+      vm_pin_buffer(buffer, size, false); // false = estamos lendo do buffer
+
+      if (fd == 1)
       {
-        unsigned bytes_left_in_page = PGSIZE - pg_ofs(user_ptr);
-        unsigned bytes_to_write = size - bytes_written;
-        if (bytes_to_write > bytes_left_in_page)
-        {
-          bytes_to_write = bytes_left_in_page;
-        }
-        void *k_ptr = pagedir_get_page(thread_current()->pagedir, user_ptr);
-        if (k_ptr == NULL)
-        {
-          struct thread *cur = thread_current();
-          printf("%s: exit(%d)\n", cur->name, -1);
-          cur->exit_status = -1;
-          thread_exit();
-        }
-        putbuf(k_ptr, bytes_to_write);
-        bytes_written += bytes_to_write;
-        user_ptr += bytes_to_write;
+        putbuf(buffer, size);
+        bytes_written = size;
       }
+      else if (fd >= 2 && fd < 128)
+      {
+        struct thread *cur = thread_current();
+        struct file *file_ptr = cur->open_files[fd];
+
+        if (file_ptr != NULL)
+        {
+          lock_acquire(&filesys_lock);
+          bytes_written = file_write(file_ptr, buffer, size);
+          lock_release(&filesys_lock);
+        }
+      }
+
+      // Despina o buffer DEPOIS de largar o lock
+      vm_unpin_buffer(buffer, size);
+      f->eax = bytes_written;
+      break;
     }
-    else if (fd >= 2 && fd < 128)
-    {
-      struct thread *cur = thread_current();
-      struct file *file_ptr = cur->open_files[fd];
-
-      if (file_ptr == NULL)
-      {
-        // fd não está aberto ou é inválido, bytes_written já é -1
-      }
-      else
-      {
-        lock_acquire(&filesys_lock);
-
-        const char *user_ptr = (const char *)buffer;
-        bytes_written = 0;
-
-        while ((unsigned)bytes_written < size)
-        {
-          // Calcula quanto escrever *nesta página*
-          unsigned bytes_left_in_page = PGSIZE - pg_ofs(user_ptr);
-          unsigned bytes_to_write = size - bytes_written;
-          if (bytes_to_write > bytes_left_in_page)
-          {
-            bytes_to_write = bytes_left_in_page;
-          }
-
-          void *k_ptr = pagedir_get_page(thread_current()->pagedir, user_ptr);
-          if (k_ptr == NULL)
-          {
-            lock_release(&filesys_lock);
-            struct thread *cur_err = thread_current();
-            printf("%s: exit(%d)\n", cur_err->name, -1);
-            cur_err->exit_status = -1;
-            thread_exit();
-          }
-
-          // Escreve o pedaço do KERNEL para o arquivo
-          int current_written = file_write(file_ptr, k_ptr, bytes_to_write);
-
-          if (current_written < 0)
-          { // Erro na escrita ou escreveu 0 bytes inesperadamente
-            if (bytes_written == 0)
-            {
-              bytes_written = -1; // Sinaliza erro
-            }
-            break;
-          }
-          if (current_written == 0)
-          {
-            break; // Sai do loop
-          }
-          bytes_written += current_written;
-          user_ptr += current_written;
-
-          if ((unsigned)current_written < bytes_to_write)
-          {
-            break;
-          }
-        }
-
-        lock_release(&filesys_lock);
-      }
-    }
-
-    // Define o valor de retorno (bytes escritos ou -1) em EAX
-    f->eax = bytes_written;
-    break;
-  }
 
     case SYS_CREATE:
     {
@@ -176,7 +247,8 @@ syscall_handler(struct intr_frame *f)
       unsigned initial_size = *(unsigned *)(f->esp + 8);
 
       // Valida o ponteiro do nome do arquivo em si
-      validate_user_pointer(file);
+      //validate_user_pointer(file);
+      validate_user_string(file);
 
       lock_acquire(&filesys_lock);
       bool success = filesys_create(file, initial_size);
@@ -189,7 +261,8 @@ syscall_handler(struct intr_frame *f)
     {
       validate_user_pointer(f->esp + 7);
       const char *filename = *(const char **)(f->esp + 4);
-      validate_user_pointer(filename);
+      //validate_user_pointer(filename);
+      validate_user_string(filename);
 
       struct file *file_ptr = NULL;
       int fd = -1;
@@ -264,86 +337,34 @@ syscall_handler(struct intr_frame *f)
       void *buffer = *(void **)(f->esp + 8);
       unsigned size = *(unsigned *)(f->esp + 12);
 
-      validate_user_pointer(buffer);
-      if (size > 0)
-      {
-        validate_user_pointer(buffer + size - 1);
-      }
-
       int bytes_read = -1;
+
+      vm_pin_buffer(buffer, size, true);
 
       if (fd == 0)
       {
-        unsigned i;
         uint8_t *buf_ptr = (uint8_t *)buffer;
-        for (i = 0; i < size; i++)
+        for (unsigned i = 0; i < size; i++)
         {
           buf_ptr[i] = input_getc();
         }
-        bytes_read = i;
+        bytes_read = size;
       }
       else if (fd >= 2 && fd < 128)
       {
         struct thread *cur = thread_current();
         struct file *file_ptr = cur->open_files[fd];
 
-        if (file_ptr == NULL)
+        if (file_ptr != NULL)
         {
-          // fd inválido ou não aberto, bytes_read permanece -1
-        }
-        else
-        {
-          char *kernel_buffer = palloc_get_page(0);
-          if (kernel_buffer == NULL)
-          {
-            bytes_read = -1;
-          }
-          else
-          {
-            bytes_read = 0;
-            char *user_buf_ptr = (char *)buffer;
-
-            lock_acquire(&filesys_lock);
-
-            while (bytes_read < (int)size)
-            {
-              int bytes_to_read_this_time = size - bytes_read;
-              if (bytes_to_read_this_time > PGSIZE)
-              {
-                bytes_to_read_this_time = PGSIZE;
-              }
-              if (bytes_to_read_this_time <= 0)
-              {
-                break;
-              }
-
-              // Lê do arquivo PARA o buffer do KERNEL
-              int current_read = file_read(file_ptr, kernel_buffer, bytes_to_read_this_time);
-
-              if (current_read <= 0)
-              {// EOF ou erro na leitura do arquivo
-                break;
-              }
-
-              // Copia do buffer do KERNEL para o buffer do USUÁRIO
-              memcpy(user_buf_ptr + bytes_read, kernel_buffer, current_read);
-
-              bytes_read += current_read;
-
-              // Se leu menos que o solicitado, atingiu EOF
-              if (current_read < bytes_to_read_this_time)
-              {
-                break;
-              }
-            }
-
-            lock_release(&filesys_lock);
-            palloc_free_page(kernel_buffer);
-          }
+          lock_acquire(&filesys_lock);
+          bytes_read = file_read(file_ptr, buffer, size);
+          lock_release(&filesys_lock);
         }
       }
 
-      // Define o valor de retorno (bytes lidos ou -1) em EAX
+      // Despina o buffer DEPOIS de largar o lock
+      vm_unpin_buffer(buffer, size);
       f->eax = bytes_read;
       break;
     }
@@ -351,14 +372,59 @@ syscall_handler(struct intr_frame *f)
     case SYS_EXEC:
     {
       validate_user_pointer(f->esp + 7);
-
-      // Obtém o argumento (ponteiro para a string da linha de comando)
       const char *cmd_line = *(const char **)(f->esp + 4);
-      validate_user_pointer(cmd_line);
 
+      if (cmd_line == NULL || !is_user_vaddr(cmd_line))
+        thread_exit_with_status(-1);
+
+      char *upage = pg_round_down(cmd_line);
+      char *end = (char *)cmd_line;
+
+      while (true)
+      {
+        if (!is_user_vaddr(end))
+          thread_exit_with_status(-1);
+
+        if (pg_round_down(end) != upage)
+        {
+          upage = pg_round_down(end);
+          if (!vm_pin_page(upage))
+            thread_exit_with_status(-1);
+        }
+        else if (upage == pg_round_down(cmd_line))
+        {
+          if (!vm_pin_page(upage))
+            thread_exit_with_status(-1);
+        }
+
+        if (*end == '\0')
+          break;
+        end++;
+      }
+
+      //Agora que todas as páginas da string estão pinadas, podemos executar
       tid_t child_tid = process_execute(cmd_line);
 
-      // Define o valor de retorno (o TID do filho ou -1) em EAX
+      upage = pg_round_down(cmd_line);
+      end = (char *)cmd_line;
+      while (true)
+      {
+        if (pg_round_down(end) != upage)
+        {
+          vm_unpin_page(upage);
+          upage = pg_round_down(end);
+        }
+        else if (upage == pg_round_down(cmd_line))
+        {
+          vm_unpin_page(upage);
+        }
+
+        if (*end == '\0')
+          break;
+        end++;
+      }
+      vm_unpin_page(upage); // Despina a última página
+
       f->eax = child_tid;
       break;
     }
@@ -382,7 +448,7 @@ syscall_handler(struct intr_frame *f)
       // Verifica se o fd corresponde a um arquivo aberto
       if (file_ptr == NULL)
       {
-        f->eax = -1; // Retorna -1 se o fd não estiver aberto
+        f->eax = -1;
         break;
       }
       lock_acquire(&filesys_lock);
@@ -400,7 +466,8 @@ syscall_handler(struct intr_frame *f)
     {
       validate_user_pointer(f->esp + 7);
       const char *filename = *(const char **)(f->esp + 4);
-      validate_user_pointer(filename);
+      //validate_user_pointer(filename);
+      validate_user_string(filename);
 
       lock_acquire(&filesys_lock);
 
@@ -476,14 +543,139 @@ syscall_handler(struct intr_frame *f)
       // Valida o ponteiro para o argumento (TID)
       validate_user_pointer(f->esp + 7);
 
-      // Obtém o TID do filho da pilha
       tid_t child_tid = *(tid_t *)(f->esp + 4);
-
-      // Chama a sua função de kernel já existente
       int status = process_wait(child_tid);
 
-      // Coloca o status de retorno no registrador EAX
       f->eax = status;
+      break;
+    }
+
+    case SYS_MMAP:
+    {
+      //Obter argumentos
+      validate_user_pointer(f->esp + 11);
+      int fd = *(int *)(f->esp + 4);
+      void *addr = *(void **)(f->esp + 8);
+
+      if (addr == NULL || pg_ofs(addr) != 0 || fd < 2)
+      {
+        f->eax = -1;
+        break;
+      }
+
+      struct thread *cur = thread_current();
+      struct file *file = cur->open_files[fd];
+      if (file == NULL)
+      {
+        f->eax = -1;
+        break;
+      }
+
+      lock_acquire(&filesys_lock);
+      off_t file_len = file_length(file);
+      if (file_len == 0)
+      {
+        lock_release(&filesys_lock);
+        f->eax = -1;
+        break;
+      }
+
+      struct file *reopened_file = file_reopen(file);
+      lock_release(&filesys_lock);
+
+      if (reopened_file == NULL)
+      {
+        f->eax = -1;
+        break;
+      }
+
+      //Criar o mmap_entry
+      struct mmap_entry *mmap_e = malloc(sizeof(struct mmap_entry));
+      if (mmap_e == NULL)
+      {
+        file_close(reopened_file);
+        f->eax = -1;
+        break;
+      }
+
+      mmap_e->mapid = cur->next_mapid++;
+      mmap_e->file = reopened_file;
+      mmap_e->addr = addr;
+      mmap_e->page_count = 0;
+      list_push_back(&cur->mmap_list, &mmap_e->elem);
+
+      //Criar as entradas da SPT (Lazy Loading)
+      size_t offset = 0;
+      bool overlap_found = false;
+
+      while (file_len > 0)
+      {
+        size_t page_read_bytes = file_len < PGSIZE ? file_len : PGSIZE;
+        void *upage = addr + offset;
+
+        if (spt_find_page(&cur->spt, upage) != NULL ||
+            upage >= (PHYS_BASE - MAX_STACK_SIZE))
+        {
+          overlap_found = true;
+          f->eax = -1;
+          break;
+        }
+
+        struct spt_entry *spt_e = malloc(sizeof(struct spt_entry));
+        if (spt_e == NULL)
+        {
+          overlap_found = true; // Trata como falha de overlap
+          f->eax = -1;
+          break;
+        }
+
+        spt_e->upage = upage;
+        spt_e->kpage = NULL;
+        spt_e->status = IN_FILESYS;
+        spt_e->writable = true;
+        spt_e->type = PAGE_FILE;
+        spt_e->file = reopened_file;
+        spt_e->file_offset = offset;
+        spt_e->read_bytes = page_read_bytes;
+
+        hash_insert(&cur->spt, &spt_e->elem);
+
+        mmap_e->page_count++;
+        file_len -= page_read_bytes;
+        offset += PGSIZE;
+      }
+
+      if (overlap_found)
+      {
+        //Desfaz as SPT entries que já foram criadas 
+        for (size_t i = 0; i < mmap_e->page_count; i++)
+        {
+          void *page_to_free = mmap_e->addr + (i * PGSIZE);
+          struct spt_entry *spt_e = spt_find_page(&cur->spt, page_to_free);
+          if (spt_e)
+          {
+            hash_delete(&cur->spt, &spt_e->elem);
+            free(spt_e);
+          }
+        }
+
+        list_remove(&mmap_e->elem);
+        free(mmap_e);
+        file_close(reopened_file);
+        f->eax = -1;
+      }
+      else
+      {
+        f->eax = mmap_e->mapid;
+      }
+      break;
+    }
+
+    case SYS_MUNMAP:
+    {
+      validate_user_pointer(f->esp + 7);
+      mapid_t mapping = *(mapid_t *)(f->esp + 4);
+      do_munmap(mapping);
       break;
     }
 
@@ -495,17 +687,11 @@ syscall_handler(struct intr_frame *f)
   }
 }
 
-// Valida um ponteiro do espaço de usuário.
-// Encerra o processo se o ponteiro for inválido.
-static void
-validate_user_pointer(const void *uaddr)
+/* Sai da thread e define o status de saída. */
+void thread_exit_with_status(int status)
 {
   struct thread *cur = thread_current();
-  // Verifica se não é nulo e se está abaixo de PHYS_BASE, e se está mapeado na tabela de páginas.
-  if (uaddr == NULL || !is_user_vaddr(uaddr) || pagedir_get_page(cur->pagedir, uaddr) == NULL)
-  {
-    printf("%s: exit(%d)\n", cur->name, -1);
-    cur->exit_status = -1;
-    thread_exit();
-  }
+  cur->exit_status = status;
+  printf("%s: exit(%d)\n", cur->name, status);
+  thread_exit();
 }

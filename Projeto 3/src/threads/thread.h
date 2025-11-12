@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include "threads/synch.h"
 #include "filesys/file.h"
+#include "lib/kernel/hash.h"
+#include "vm/page.h"
+#include "userprog/syscall.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -25,6 +28,16 @@ typedef int tid_t;
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
+
+// Rastreia um único mapeamento de mmap
+struct mmap_entry
+{
+   mapid_t mapid;
+   struct file *file;
+   void *addr;
+   size_t page_count;
+   struct list_elem elem;
+};
 
 /* A kernel thread or user process.
 
@@ -114,6 +127,10 @@ struct thread
     bool load_success;
 
     struct file *executable_file;
+    struct hash spt; //Tabela de Páginas Suplementar (SPT)
+    struct list mmap_list;
+    mapid_t next_mapid;
+
 #endif
 
     /* Owned by thread.c. */

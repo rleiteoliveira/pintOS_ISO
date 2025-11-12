@@ -18,6 +18,9 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/syscall.h"
+#include "vm/page.h"
+#include "vm/frame.h"
+#include "threads/malloc.h"
 
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void (**eip)(void));
@@ -129,8 +132,15 @@ start_process (void *file_name_)
   // Se o load teve sucesso, configura a pilha com os argumentos
   if (success)
   {
+    /* "Pina" a página da pilha. Isso garante que, se setup_stack
+       causar um page fault (o que não deveria, mas por segurança)
+       ou se a pilha crescer, ela não causará evicção
+       enquanto empurramos os argumentos. */
+    vm_pin_page(((uint8_t *)PHYS_BASE) - PGSIZE);
     // Passa a linha de comando inteira para setup_stack
     success = setup_stack(&if_.esp, full_cmdline);
+    /* "Despina" a página da pilha agora que terminamos. */
+    vm_unpin_page(((uint8_t *)PHYS_BASE) - PGSIZE);
   }
 
   /* If load failed, quit. */
@@ -219,9 +229,16 @@ process_exit (void)
 
   intr_set_level(old_level);
 
+  //Desmapeia todos os arquivos mmap antes de fechar os arquivos
+  while (!list_empty(&cur->mmap_list))
+  {
+    struct mmap_entry *mmap_e = list_entry(list_pop_front(&cur->mmap_list), struct mmap_entry, elem);
+    do_munmap(mmap_e->mapid);
+  }
+
   lock_acquire(&filesys_lock);
 
-  // 1. Fechar todos os arquivos abertos (FDs 2 a 127)
+  //Fechar todos os arquivos abertos
   for (int fd = 2; fd < 128; fd++)
   {
     if (cur->open_files[fd] != NULL)
@@ -231,7 +248,7 @@ process_exit (void)
     }
   }
 
-  // 2. Permitir escrita e fechar o executável
+  //Permitir escrita e fechar o executável
   if (cur->executable_file != NULL)
   {
     file_allow_write(cur->executable_file);
@@ -239,6 +256,9 @@ process_exit (void)
   }
 
   lock_release(&filesys_lock);
+
+  // Destruir a SPT e liberar todos os recursos.
+  spt_destroy(&cur->spt);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -362,6 +382,7 @@ struct Elf32_Phdr
       goto done;
     process_activate();
 
+    spt_init(&t->spt); //Inicializa a SPT
     lock_acquire(&filesys_lock);
 
     /* Open executable file. */
@@ -462,8 +483,6 @@ struct Elf32_Phdr
 
 /* load() helpers. */
 
-static bool install_page (void *upage, void *kpage, bool writable);
-
 /* Checks whether PHDR describes a valid, loadable segment in
    FILE and returns true if so, false otherwise. */
 static bool
@@ -531,7 +550,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
+  //file_seek (file, ofs);
   while (read_bytes > 0 || zero_bytes > 0) 
     {
       /* Calculate how to fill this page.
@@ -540,30 +559,70 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
+      if (page_read_bytes == 0)
+      {
+        //Página BSS (toda de zeros) -> é ANÔNIMA
+        if (!vm_alloc_and_install_page(upage, writable))
+          return false;
+      }
+      else
+      {
+        struct spt_entry *spt_e = malloc(sizeof(struct spt_entry));
+        if (spt_e == NULL)
+          return false;
+
+        spt_e->upage = upage;
+        spt_e->kpage = NULL;
+        spt_e->status = IN_FILESYS;
+        spt_e->writable = writable;
+        spt_e->type = PAGE_FILE;
+        spt_e->file = file;
+        spt_e->file_offset = ofs;
+        spt_e->read_bytes = page_read_bytes;
+
+        struct hash *spt = &thread_current()->spt;
+        if (hash_insert(spt, &spt_e->elem) != NULL)
+        {
+          free(spt_e);
+          return false;
+        }
+      }
+
+      // if (!vm_alloc_and_install_page(upage, writable))
+      // {
+      //   return false;
+      // }
+
       /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
+      //Alterado
+      // uint8_t *kpage = spt_get_kpage(&thread_current()->spt, upage);
+      // if (kpage == NULL)
+      // {
+      //   vm_free_page(upage);
+      //   return false;
+      // }
 
       /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+      // if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+      //   {
+      //     //palloc_free_page (kpage);
+      //     vm_free_page(upage);
+      //     return false; 
+      //   }
+      //memset (kpage + page_read_bytes, 0, page_zero_bytes);
 
       /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
+      // if (!install_page (upage, kpage, writable)) 
+      //   {
+      //     palloc_free_page (kpage);
+      //     return false; 
+      //   }
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      ofs += page_read_bytes; // Avança o offset do arquivo
     }
   return true;
 }
@@ -574,85 +633,84 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack(void **esp, const char *cmdline)
 {
-  uint8_t *kpage;
   bool success = false;
+  void *upage = ((uint8_t *)PHYS_BASE) - PGSIZE;
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
+  //Aloca a primeira página da pilha usando nosso novo sistema de VM.
+  success = vm_alloc_and_install_page(upage, true);
+  
+  if (success)
+  {
+    // Alteração
+    *esp = PHYS_BASE;
+
+    char *cmdline_copy;
+    char *token, *save_ptr;
+    int argc = 0;
+    void *argv_addrs[128];
+
+    // 1. Copia a linha de comando para poder modificar (strtok_r modifica)
+    cmdline_copy = palloc_get_page(0);
+    if (cmdline_copy == NULL)
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-      {
-        //Alteração
-        *esp = PHYS_BASE;
-
-        char *cmdline_copy;
-        char *token, *save_ptr;
-        int argc = 0;
-        void *argv_addrs[128];
-
-        // 1. Copia a linha de comando para poder modificar (strtok_r modifica)
-        cmdline_copy = palloc_get_page(0);
-        if (cmdline_copy == NULL)
-        {
-          palloc_free_page(kpage);
-          return false;
-        }
-        strlcpy(cmdline_copy, cmdline, PGSIZE);
-
-        // 2. Fase 1: Empilhar as strings dos argumentos
-        for (token = strtok_r(cmdline_copy, " ", &save_ptr); token != NULL;
-             token = strtok_r(NULL, " ", &save_ptr))
-        {
-          int len = strlen(token) + 1; // +1 para o '\0'
-          *esp -= len;
-          memcpy(*esp, token, len);
-          argv_addrs[argc] = *esp; // Salva o endereço do argumento
-          argc++;
-
-          // Verifica estouro de pilha
-          if ((uintptr_t)*esp < (uintptr_t)(PHYS_BASE - PGSIZE))
-          {
-            palloc_free_page(cmdline_copy);
-            palloc_free_page(kpage);
-            return false;
-          }
-        }
-
-        // 3. Fase 2: Alinhamento de 4 bytes
-        int padding = (uintptr_t)*esp % 4;
-        *esp -= padding;
-        memset(*esp, 0, padding);
-
-        // 4. Fase 3: Ponteiros
-        // argv[argc] (nulo)
-        *esp -= sizeof(char *);
-        *(char **)*esp = NULL;
-
-        // Ponteiros para os argumentos (argv[argc-1] até argv[0])
-        for (int i = argc - 1; i >= 0; i--)
-        {
-          *esp -= sizeof(char *);
-          *(void **)*esp = argv_addrs[i];
-        }
-
-        // 5. Fase 4: argv e argc
-        void *argv_ptr = *esp;   // Salva o endereço de argv[0]
-        *esp -= sizeof(char **); // Empilha o ponteiro argv
-        *(void **)*esp = argv_ptr;
-
-        *esp -= sizeof(int); // Empilha argc
-        *(int *)*esp = argc;
-
-        // 6. Fase 5: Endereço de retorno falso
-        *esp -= sizeof(void *);
-        *(void **)*esp = NULL;
-
-        palloc_free_page(cmdline_copy);
-      }
-      else
-        palloc_free_page (kpage);
+      //palloc_free_page(kpage);
+      vm_free_page(upage); // Desfaz a alocação da página da pilha
+      return false;
     }
+    strlcpy(cmdline_copy, cmdline, PGSIZE);
+
+    // 2. Fase 1: Empilhar as strings dos argumentos
+    for (token = strtok_r(cmdline_copy, " ", &save_ptr); token != NULL;
+         token = strtok_r(NULL, " ", &save_ptr))
+    {
+      int len = strlen(token) + 1; // +1 para o '\0'
+      *esp -= len;
+      memcpy(*esp, token, len);
+      argv_addrs[argc] = *esp; // Salva o endereço do argumento
+      argc++;
+
+      // Verifica estouro de pilha
+      if ((uintptr_t)*esp < (uintptr_t)(PHYS_BASE - PGSIZE))
+      {
+        palloc_free_page(cmdline_copy);
+        //palloc_free_page(kpage);
+        vm_free_page(upage); // Desfaz a alocação da página da pilha
+        return false;
+      }
+    }
+
+    // 3. Fase 2: Alinhamento de 4 bytes
+    int padding = (uintptr_t)*esp % 4;
+    *esp -= padding;
+    memset(*esp, 0, padding);
+
+    // 4. Fase 3: Ponteiros
+    // argv[argc] (nulo)
+    *esp -= sizeof(char *);
+    *(char **)*esp = NULL;
+
+    // Ponteiros para os argumentos (argv[argc-1] até argv[0])
+    for (int i = argc - 1; i >= 0; i--)
+    {
+      *esp -= sizeof(char *);
+      *(void **)*esp = argv_addrs[i];
+    }
+
+    // 5. Fase 4: argv e argc
+    void *argv_ptr = *esp;   // Salva o endereço de argv[0]
+    *esp -= sizeof(char **); // Empilha o ponteiro argv
+    *(void **)*esp = argv_ptr;
+
+    *esp -= sizeof(int); // Empilha argc
+    *(int *)*esp = argc;
+
+    // 6. Fase 5: Endereço de retorno falso
+    *esp -= sizeof(void *);
+    *(void **)*esp = NULL;
+
+    palloc_free_page(cmdline_copy);
+  }
+
   return success;
 }
 
@@ -665,8 +723,8 @@ setup_stack(void **esp, const char *cmdline)
    with palloc_get_page().
    Returns true on success, false if UPAGE is already mapped or
    if memory allocation fails. */
-static bool
-install_page (void *upage, void *kpage, bool writable)
+bool
+install_page(void *upage, void *kpage, bool writable)
 {
   struct thread *t = thread_current ();
 

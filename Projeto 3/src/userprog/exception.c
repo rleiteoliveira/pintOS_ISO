@@ -5,6 +5,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -153,35 +154,37 @@ page_fault (struct intr_frame *f)
      body, and replace it with code that brings in the page to
      which fault_addr refers. */
 
-     //Adição
-  if (user) // A falha ocorreu enquanto o CPU estava em modo usuário?
+  /* Passa a falha para o manipulador da VM.
+       Passamos o f->esp para a heurística de crescimento da pilha. */
+  bool success = vm_handle_page_fault(fault_addr, not_present, write, user, f->esp);
+
+  //Se o manipulador da VM não conseguiu resolver (retornou false)
+  if (!success)
   {
-     struct thread *cur = thread_current();
-     printf("%s: exit(%d)\n", cur->name, -1); // Imprime a mensagem padrão de saída com erro
-     cur->exit_status = -1;
-     thread_exit();
-  }
-  else // A falha ocorreu enquanto o CPU estava em modo kernel.
-  {
-     /* O kernel falhou. FOI UM BUG DO KERNEL OU UM PONTEIRO RUIM DO USUÁRIO? */
-     if (is_user_vaddr(fault_addr))
+     if (user) // A falha ocorreu enquanto o CPU estava em modo usuário?
      {
-        // O kernel tentou acessar memória de usuário inválida (syscall ruim).
-        // Trate como um erro do usuário (exit -1).
         struct thread *cur = thread_current();
-        printf("%s: exit(%d)\n", cur->name, -1);
+        printf("%s: exit(%d)\n", cur->name, -1); // Imprime a mensagem padrão de saída com erro
         cur->exit_status = -1;
         thread_exit();
      }
-     else
+     else // A falha ocorreu enquanto o CPU estava em modo kernel.
      {
-        // Imprime informações detalhadas sobre a falha do kernel e entra em pânico.
-        printf("Page fault at %p: %s error %s page in kernel context.\n",
-               fault_addr,
-               not_present ? "not present" : "rights violation",
-               write ? "writing" : "reading");
-        intr_dump_frame(f);
-        PANIC("Kernel page fault");
+        /* O kernel falhou. FOI UM BUG DO KERNEL OU UM PONTEIRO RUIM DO USUÁRIO? */
+        if (is_user_vaddr(fault_addr))
+        {
+           // O kernel tentou acessar memória de usuário inválida (syscall ruim).
+           // Trate como um erro do usuário (exit -1).
+           struct thread *cur = thread_current();
+           printf("%s: exit(%d)\n", cur->name, -1);
+           cur->exit_status = -1;
+           thread_exit();
+        }
+        else
+        {
+           intr_dump_frame(f);
+           PANIC("Kernel page fault");
+        }
      }
   }
 }
