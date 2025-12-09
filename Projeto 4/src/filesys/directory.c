@@ -21,12 +21,34 @@ struct dir_entry
     bool in_use;                        /* In use or free? */
   };
 
+// Verifica se o diretório contém apenas '.' e '..'
+static bool
+is_dir_empty (struct inode *inode)
+{
+  struct dir_entry e;
+  off_t ofs;
+
+  for (ofs = 0; inode_read_at (inode, &e, sizeof e, ofs) == sizeof e;
+       ofs += sizeof e)
+    {
+      if (e.in_use)
+        {
+          //Se encontrar qualquer entrada que NÃO seja . ou .., não está vazio
+          if (strcmp (e.name, ".") != 0 && strcmp (e.name, "..") != 0)
+            {
+              return false;
+            }
+        }
+    }
+  return true;
+}
+
 /* Creates a directory with space for ENTRY_CNT entries in the
    given SECTOR.  Returns true if successful, false on failure. */
 bool
 dir_create (block_sector_t sector, size_t entry_cnt)
 {
-  return inode_create (sector, entry_cnt * sizeof (struct dir_entry));
+  return inode_create (sector, entry_cnt * sizeof (struct dir_entry),true);
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -148,6 +170,10 @@ dir_add (struct dir *dir, const char *name, block_sector_t inode_sector)
   ASSERT (dir != NULL);
   ASSERT (name != NULL);
 
+  // Não permitir adição em diretório removido
+  if (inode_is_removed (dir->inode))
+    return false;
+
   /* Check NAME for validity. */
   if (*name == '\0' || strlen (name) > NAME_MAX)
     return false;
@@ -201,6 +227,23 @@ dir_remove (struct dir *dir, const char *name)
   if (inode == NULL)
     goto done;
 
+  if (inode_is_dir (inode))
+    {
+      // Se é um diretório, verifique se não está sendo usado como raiz por ninguém
+      struct dir *target_dir = dir_open(inode);
+      bool is_empty = is_dir_empty(inode);
+      dir_close(target_dir);
+
+      if (!is_empty)
+        {
+          goto done; // Falha se não estiver vazio
+        }
+      
+      // Proteger contra remoção da raiz (caso o usuário tente rm "..")
+      if (inode_get_inumber(inode) == ROOT_DIR_SECTOR)
+         goto done;
+    }
+
   /* Erase directory entry. */
   e.in_use = false;
   if (inode_write_at (dir->inode, &e, sizeof e, ofs) != sizeof e) 
@@ -228,9 +271,24 @@ dir_readdir (struct dir *dir, char name[NAME_MAX + 1])
       dir->pos += sizeof e;
       if (e.in_use)
         {
+          // Ignora as entradas . e ..
+          if (strcmp(e.name, ".") == 0 || strcmp(e.name, "..") == 0)
+            {
+              continue;
+            }
           strlcpy (name, e.name, NAME_MAX + 1);
           return true;
         } 
     }
   return false;
+}
+
+void dir_setpos (struct dir *dir, off_t pos) {
+    ASSERT (dir != NULL);
+    dir->pos = pos;
+}
+
+off_t dir_getpos (struct dir *dir) {
+    ASSERT (dir != NULL);
+    return dir->pos;
 }

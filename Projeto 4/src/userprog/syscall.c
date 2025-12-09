@@ -15,6 +15,8 @@
 #include "threads/malloc.h"
 #include "threads/palloc.h"
 #include <string.h>
+#include "filesys/directory.h"
+#include "filesys/inode.h"
 
 
 static void syscall_handler (struct intr_frame *);
@@ -108,6 +110,13 @@ syscall_handler(struct intr_frame *f)
       }
       else
       {
+        // Não permitir escrita em diretórios
+         struct inode *inode = file_get_inode(file_ptr);
+         if (inode_is_dir(inode))
+         {
+            f->eax = -1;
+            break;
+         }
         lock_acquire(&filesys_lock);
 
         const char *user_ptr = (const char *)buffer;
@@ -484,6 +493,113 @@ syscall_handler(struct intr_frame *f)
 
       // Coloca o status de retorno no registrador EAX
       f->eax = status;
+      break;
+    }
+
+case SYS_MKDIR:
+    {
+      validate_user_pointer(f->esp + 7);
+
+      // Obtém o argumento (nome do diretório)
+      const char *dir = *(const char **)(f->esp + 4);
+      
+      validate_user_pointer(dir);
+
+      // Chama a função do sistema de arquivos
+      lock_acquire(&filesys_lock);
+      bool success = filesys_mkdir(dir);
+      lock_release(&filesys_lock);
+
+      f->eax = success;
+      break;
+    }
+
+    case SYS_CHDIR:
+    {
+      validate_user_pointer(f->esp + 7);
+      const char *dir = *(const char **)(f->esp + 4);
+      validate_user_pointer(dir);
+
+      lock_acquire(&filesys_lock);
+      bool success = filesys_chdir(dir);
+      lock_release(&filesys_lock);
+
+      f->eax = success;
+      break;
+    }
+
+    case SYS_ISDIR:
+    {
+      validate_user_pointer(f->esp + 7);
+      int fd = *(int *)(f->esp + 4);
+
+      if (fd < 2 || fd >= 128) 
+        {
+          f->eax = false;
+          break;
+        }
+
+      struct thread *cur = thread_current();
+      struct file *file_ptr = cur->open_files[fd];
+      
+      if (file_ptr == NULL) 
+        {
+          f->eax = false;
+        }
+      else 
+        {
+          //Verifica se o inode subjacente é um diretório
+          struct inode *inode = file_get_inode(file_ptr);
+          f->eax = inode_is_dir(inode);
+        }
+      break;
+    }
+
+    case SYS_READDIR:
+    {
+      validate_user_pointer(f->esp + 11);
+      int fd = *(int *)(f->esp + 4);
+      char *name = *(char **)(f->esp + 8);
+      validate_user_pointer(name);
+
+      if (fd < 2 || fd >= 128)
+        {
+          f->eax = false;
+          break;
+        }
+
+      struct thread *cur = thread_current();
+      struct file *file_ptr = cur->open_files[fd];
+
+      if (file_ptr == NULL)
+        {
+          f->eax = false;
+        }
+      else 
+        {
+          struct inode *inode = file_get_inode(file_ptr);
+          if (!inode_is_dir(inode))
+            {
+              f->eax = false;
+            }
+          else 
+            {
+              lock_acquire(&filesys_lock);
+              
+              struct dir *dir = dir_open(inode_reopen(inode)); // Abre nova referência
+              if (dir) {
+                  dir_setpos(dir, file_tell(file_ptr)); // Sincroniza posição
+                  bool success = dir_readdir(dir, name);
+                  file_seek(file_ptr, dir_getpos(dir)); // Atualiza posição
+                  
+                  dir_close(dir);
+                  f->eax = success;
+              } else {
+                  f->eax = false;
+              }
+              lock_release(&filesys_lock);
+            }
+        }
       break;
     }
 

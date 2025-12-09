@@ -521,6 +521,10 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
 
+  #ifdef FILESYS
+  t->cwd = NULL;
+  #endif
+
   //Adição
   sema_init(&t->wait_sema, 0);
   t->exit_status = -1;

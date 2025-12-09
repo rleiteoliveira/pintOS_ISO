@@ -7,6 +7,8 @@
 #include "threads/synch.h"
 #include "filesys/file.h"
 
+struct dir;
+
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -114,6 +116,10 @@ struct thread
     bool load_success;
 
     struct file *executable_file;
+#endif
+
+#ifdef FILESYS
+    struct dir *cwd;
 #endif
 
     /* Owned by thread.c. */
