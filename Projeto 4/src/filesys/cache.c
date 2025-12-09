@@ -131,9 +131,6 @@ cache_write (block_sector_t sector, const void *buffer)
       cache[idx].is_valid = true;
       cache[idx].sector = sector;
       
-      /* Em Write-Back, lemos o conteúdo antigo antes de sobrescrever.
-         Isso é vital se a escrita não for alinhada, mas aqui
-         estamos assumindo blocos inteiros. Lemos por segurança. */
       block_read (fs_device, sector, cache[idx].data);
       
       lock_release(&cache[idx].entry_lock);
@@ -142,13 +139,10 @@ cache_write (block_sector_t sector, const void *buffer)
   lock_acquire(&cache[idx].entry_lock);
   cache[idx].accessed = true;
   
-  /* Cópia dos dados para a RAM */
+  // Cópia dos dados para a RAM
   memcpy (cache[idx].data, buffer, BLOCK_SECTOR_SIZE);
   
-  /* --- MUDANÇA CRUCIAL: WRITE-BACK --- */
-  /* Apenas marcamos como sujo. NÃO escrevemos no disco agora. */
   cache[idx].is_dirty = true; 
-  /* ----------------------------------- */
   
   lock_release(&cache[idx].entry_lock);
   
@@ -161,13 +155,13 @@ cache_flush (void)
   lock_acquire (&cache_global_lock);
   for (int i = 0; i < CACHE_SIZE; i++)
     {
-      lock_acquire(&cache[i].entry_lock); /* Adquirir lock da entrada */
+      lock_acquire(&cache[i].entry_lock);
       if (cache[i].is_valid && cache[i].is_dirty)
         {
           block_write (fs_device, cache[i].sector, cache[i].data);
           cache[i].is_dirty = false;
         }
-      lock_release(&cache[i].entry_lock); /* Liberar lock da entrada */
+      lock_release(&cache[i].entry_lock);
     }
   lock_release (&cache_global_lock);
 }
